@@ -27,7 +27,7 @@ ENV/
 data/raw/
 data/processed/
 
-# Model artifacts
+# Model artifacts — all runtime outputs (checkpoints, scalers, plots, logs)
 models/
 *.pkl
 *.joblib

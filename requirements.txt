@@ -9,3 +9,5 @@ requests
 seaborn
 lxml
 psycopg2-binary
+torch>=2.2.0
+joblib
