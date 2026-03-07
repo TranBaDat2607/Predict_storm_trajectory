@@ -102,6 +102,7 @@ def _upsert_observations(cur, chunk: pd.DataFrame) -> tuple[int, int]:
         ON CONFLICT (atcf_id, iso_time) DO NOTHING
         """,
         rows,
+        page_size=len(rows),
     )
     inserted = cur.rowcount
     skipped = len(rows) - inserted
@@ -121,7 +122,11 @@ def ingest(dsn: str, csv_path: Path = PROCESSED_CSV):
         if col in df.columns:
             df[col] = df[col].where(df[col].notna(), None)
 
-    print(f"Loaded {len(df):,} rows, {df['atcf_id'].nunique():,} unique storms.")
+    total_rows = len(df)
+    df = df[df["atcf_id"].notna()].copy()
+    dropped = total_rows - len(df)
+    print(f"Loaded {total_rows:,} rows, dropped {dropped:,} with null atcf_id.")
+    print(f"Remaining {len(df):,} rows, {df['atcf_id'].nunique():,} unique storms.")
 
     conn = psycopg2.connect(dsn)
     try:
