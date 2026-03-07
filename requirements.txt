@@ -1,0 +1,11 @@
+bayesian-optimization
+beautifulsoup4
+scikit-learn
+xgboost
+matplotlib
+numpy
+pandas
+requests
+seaborn
+lxml
+psycopg2-binary
