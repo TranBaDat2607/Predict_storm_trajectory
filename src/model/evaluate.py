@@ -2,7 +2,7 @@
 Evaluate StormTransformer on the test set.
 
 Usage:
-    DATABASE_URL=postgresql://... python -m src.models.evaluate
+    DATABASE_URL=postgresql://... python -m src.model.evaluate
 
 Outputs:
     - Mean haversine distance (km) vs RF baseline ~875 km
@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 
 from .dataset import (
     SEQ_LEN, N_FEATURES, FEATURE_COLS, TARGET_COLS,
+    BASIN_MAP, N_BASINS, N_ROLLOUT_STEPS,
     build_datasets, haversine_km, predict_absolute,
     _load_from_db, _engineer_features,
 )
@@ -34,7 +35,7 @@ BATCH_SIZE = 512
 
 
 def load_model(device):
-    model = StormTransformer().to(device)
+    model = StormTransformer(n_basins=N_BASINS).to(device)
     state = torch.load(CHECKPOINT, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
@@ -46,28 +47,29 @@ def evaluate_test(model, test_ds, scaler_X, scaler_y, device):
     all_pred_norm, all_X_last, all_y_true_norm = [], [], []
 
     with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            pred = model(X_batch)
+        for X_batch, y_batch, ctx_batch in loader:
+            X_batch   = X_batch.to(device)
+            ctx_batch = ctx_batch.to(device)
+            pred = model(X_batch, ctx_batch)
             all_pred_norm.append(pred.cpu().numpy())
             all_X_last.append(X_batch[:, -1, :].cpu().numpy())
-            all_y_true_norm.append(y_batch.numpy())
+            all_y_true_norm.append(y_batch[:, 0, :].numpy())  # step-1 target
 
-    pred_norm = np.concatenate(all_pred_norm, axis=0)
-    X_last = np.concatenate(all_X_last, axis=0)
+    pred_norm  = np.concatenate(all_pred_norm, axis=0)
+    X_last     = np.concatenate(all_X_last, axis=0)
     y_true_norm = np.concatenate(all_y_true_norm, axis=0)
 
-    y_true = scaler_y.inverse_transform(y_true_norm)
+    y_true     = scaler_y.inverse_transform(y_true_norm)
     X_last_raw = scaler_X.inverse_transform(X_last)
 
-    lat_t = X_last_raw[:, 0]
-    lon_t = X_last_raw[:, 1]
+    lat_t    = X_last_raw[:, 0]
+    lon_t    = X_last_raw[:, 1]
     lat_true = lat_t + y_true[:, 0]
     lon_true = lon_t + y_true[:, 1]
 
     lat_pred, lon_pred, wind_pred = predict_absolute(pred_norm, X_last, scaler_X, scaler_y)
 
-    hav_km = haversine_km(lat_true, lon_true, lat_pred, lon_pred)
+    hav_km   = haversine_km(lat_true, lon_true, lat_pred, lon_pred)
     wind_mae = np.abs(wind_pred - y_true[:, 2]).mean()
 
     print("\n=== Test Set Metrics ===")
@@ -92,13 +94,13 @@ def plot_trajectories(scaler_X, scaler_y, device):
     }
     lengths = sorted(storm_lengths.values())
     short_thr = np.percentile(lengths, 25)
-    long_thr = np.percentile(lengths, 75)
+    long_thr  = np.percentile(lengths, 75)
 
     chosen = []
     for label, condition in [
-        ("short", lambda l: l <= short_thr),
+        ("short",  lambda l: l <= short_thr),
         ("medium", lambda l: short_thr < l < long_thr),
-        ("long", lambda l: l >= long_thr),
+        ("long",   lambda l: l >= long_thr),
     ]:
         candidates = [sid for sid, l in storm_lengths.items() if condition(l)]
         if candidates:
@@ -113,11 +115,13 @@ def plot_trajectories(scaler_X, scaler_y, device):
 
     for ax, (label, sid) in zip(axes, chosen):
         storm = df[df["atcf_id"] == sid].reset_index(drop=True)
-        feats = storm[FEATURE_COLS].values.astype(np.float32)
-
-        # Normalize features
-        shape = feats.shape
+        feats      = storm[FEATURE_COLS].values.astype(np.float32)
         feats_norm = scaler_X.transform(feats).astype(np.float32)
+
+        # Build context tensor for this storm
+        basin_id    = int(storm["basin_id"].iloc[0])
+        season_norm = float(storm["season_norm"].iloc[0])
+        ctx_tensor  = torch.tensor([[basin_id, season_norm]], dtype=torch.float32).to(device)
 
         true_lats = storm["lat"].values
         true_lons = storm["lon"].values
@@ -126,14 +130,13 @@ def plot_trajectories(scaler_X, scaler_y, device):
         for i in range(len(storm) - SEQ_LEN):
             window = torch.tensor(feats_norm[i : i + SEQ_LEN]).unsqueeze(0).to(device)
             with torch.no_grad():
-                pred_norm = model(window).cpu().numpy()
+                pred_norm_t = model(window, ctx_tensor).cpu().numpy()
             X_last = feats_norm[i + SEQ_LEN - 1 : i + SEQ_LEN]
-            lat_p, lon_p, _ = predict_absolute(pred_norm, X_last, scaler_X, scaler_y)
+            lat_p, lon_p, _ = predict_absolute(pred_norm_t, X_last, scaler_X, scaler_y)
             pred_lats.append(lat_p[0])
             pred_lons.append(lon_p[0])
 
-        # Align: predicted positions correspond to rows SEQ_LEN..end
-        ax.plot(true_lons, true_lats, "b-o", markersize=3, label="Actual", linewidth=1.5)
+        ax.plot(true_lons, true_lats, "b-o", markersize=3, label="Actual",    linewidth=1.5)
         ax.plot(pred_lons, pred_lats, "r--s", markersize=3, label="Predicted", linewidth=1.5)
         ax.set_title(f"{sid} ({label})")
         ax.set_xlabel("Longitude")
@@ -159,26 +162,32 @@ def plot_loss_curves():
         log = json.load(f)
 
     epochs = [e["epoch"] for e in log]
-    train_mse = [e["train_mse"] for e in log]
-    val_mse = [e["val_mse"] for e in log]
 
-    best_epoch = epochs[int(np.argmin(val_mse))]
-    best_val = min(val_mse)
+    # Support both old (MSE) and new (km) log formats
+    if "train_loss_km" in log[0]:
+        train_loss = [e["train_loss_km"] for e in log]
+        val_loss   = [e["val_loss_km"] for e in log]
+        loss_label = "Haversine loss (km)"
+    else:
+        train_loss = [e["train_mse"] for e in log]
+        val_loss   = [e["val_mse"] for e in log]
+        loss_label = "MSE (normalized)"
+
+    best_epoch = epochs[int(np.argmin(val_loss))]
+    best_val   = min(val_loss)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    # MSE curves
-    axes[0].plot(epochs, train_mse, label="Train MSE", color="steelblue")
-    axes[0].plot(epochs, val_mse, label="Val MSE", color="darkorange")
+    axes[0].plot(epochs, train_loss, label=f"Train {loss_label}", color="steelblue")
+    axes[0].plot(epochs, val_loss,   label=f"Val {loss_label}",   color="darkorange")
     axes[0].axvline(best_epoch, color="green", linestyle="--", label=f"Best epoch {best_epoch}")
     axes[0].scatter([best_epoch], [best_val], color="green", zorder=5)
     axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MSE (normalized)")
+    axes[0].set_ylabel(loss_label)
     axes[0].set_title("Training & Validation Loss")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # Val haversine
     hav = [e["val_haversine_km"] for e in log]
     axes[1].plot(epochs, hav, color="purple", label="Val Haversine (km)")
     axes[1].axhline(875, color="red", linestyle="--", label="RF baseline 875 km")

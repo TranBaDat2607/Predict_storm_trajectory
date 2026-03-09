@@ -9,5 +9,6 @@ requests
 seaborn
 lxml
 psycopg2-binary
+python-dotenv
 torch>=2.2.0
 joblib
