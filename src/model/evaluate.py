@@ -47,10 +47,11 @@ def evaluate_test(model, test_ds, scaler_X, scaler_y, device):
     all_pred_norm, all_X_last, all_y_true_norm = [], [], []
 
     with torch.no_grad():
-        for X_batch, y_batch, ctx_batch in loader:
-            X_batch   = X_batch.to(device)
-            ctx_batch = ctx_batch.to(device)
-            pred = model(X_batch, ctx_batch)
+        for X_batch, y_batch, ctx_batch, mask_batch in loader:
+            X_batch    = X_batch.to(device)
+            ctx_batch  = ctx_batch.to(device)
+            mask_batch = mask_batch.to(device)
+            pred = model(X_batch, ctx_batch, mask=mask_batch)
             all_pred_norm.append(pred.cpu().numpy())
             all_X_last.append(X_batch[:, -1, :].cpu().numpy())
             all_y_true_norm.append(y_batch[:, 0, :].numpy())  # step-1 target
@@ -90,7 +91,7 @@ def plot_trajectories(scaler_X, scaler_y, device):
     storm_lengths = {
         sid: len(df[df["atcf_id"] == sid])
         for sid in test_storms
-        if len(df[df["atcf_id"] == sid]) > SEQ_LEN
+        if len(df[df["atcf_id"] == sid]) > 1
     }
     lengths = sorted(storm_lengths.values())
     short_thr = np.percentile(lengths, 25)
@@ -127,11 +128,20 @@ def plot_trajectories(scaler_X, scaler_y, device):
         true_lons = storm["lon"].values
 
         pred_lats, pred_lons = [], []
-        for i in range(len(storm) - SEQ_LEN):
-            window = torch.tensor(feats_norm[i : i + SEQ_LEN]).unsqueeze(0).to(device)
+        for k in range(1, len(storm)):
+            real_start = max(0, k - SEQ_LEN)
+            window_raw = feats_norm[real_start:k]
+            real_len   = len(window_raw)
+            pad_len    = SEQ_LEN - real_len
+            if pad_len > 0:
+                pad = np.zeros((pad_len, N_FEATURES), dtype=np.float32)
+                window_raw = np.concatenate([pad, window_raw], axis=0)
+            mask_np = np.array([True]*pad_len + [False]*real_len, dtype=bool)
+            mask_t  = torch.tensor(mask_np).unsqueeze(0).to(device)
+            window  = torch.tensor(window_raw).unsqueeze(0).to(device)
             with torch.no_grad():
-                pred_norm_t = model(window, ctx_tensor).cpu().numpy()
-            X_last = feats_norm[i + SEQ_LEN - 1 : i + SEQ_LEN]
+                pred_norm_t = model(window, ctx_tensor, mask=mask_t).cpu().numpy()
+            X_last = feats_norm[k-1 : k]
             lat_p, lon_p, _ = predict_absolute(pred_norm_t, X_last, scaler_X, scaler_y)
             pred_lats.append(lat_p[0])
             pred_lons.append(lon_p[0])

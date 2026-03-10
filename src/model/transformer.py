@@ -66,9 +66,10 @@ class StormTransformer(nn.Module):
         pos = torch.arange(seq_len)
         self.register_buffer("positions", pos)
 
-    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        # x:   [batch, seq_len, n_features]
-        # ctx: [batch, 2]  — (basin_id as float, season_norm)
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor, mask=None) -> torch.Tensor:
+        # x:    [batch, seq_len, n_features]
+        # ctx:  [batch, 2]  — (basin_id as float, season_norm)
+        # mask: [batch, seq_len] bool, True=padded position (ignored by attention)
         x = self.input_proj(x)                         # [batch, seq_len, d_model]
         x = x + self.pos_emb(self.positions)           # broadcast positional emb
 
@@ -78,7 +79,7 @@ class StormTransformer(nn.Module):
             ctx_emb = ctx_emb + self.season_proj(ctx[:, 1:])  # [batch, d_model]
         x = x + ctx_emb.unsqueeze(1)                   # broadcast to [batch, seq_len, d_model]
 
-        x = self.encoder(x)                            # [batch, seq_len, d_model]
+        x = self.encoder(x, src_key_padding_mask=mask) # [batch, seq_len, d_model]
         x = x[:, -1, :]                                # last-token pool [batch, d_model]
         return self.head(x)                            # [batch, n_targets]
 

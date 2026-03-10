@@ -148,21 +148,27 @@ def train():
 
         model.train()
         train_losses = []
-        for X_batch, y_batch, ctx_batch in train_loader:
-            X_batch  = X_batch.to(device)
-            y_batch  = y_batch.to(device)
-            ctx_batch = ctx_batch.to(device)
+        for X_batch, y_batch, ctx_batch, mask_batch in train_loader:
+            X_batch    = X_batch.to(device)
+            y_batch    = y_batch.to(device)
+            ctx_batch  = ctx_batch.to(device)
+            mask_batch = mask_batch.to(device)
 
             optimizer.zero_grad()
             with torch.amp.autocast(device.type, enabled=use_amp):
                 # Step 1
-                pred1 = model(X_batch, ctx_batch)
+                pred1 = model(X_batch, ctx_batch, mask=mask_batch)
                 loss1 = criterion(pred1, y_batch[:, 0, :], X_batch[:, -1, :])
 
                 # Step 2 (autoregressive rollout — fully differentiable)
                 new_row = criterion.build_next_row(X_batch[:, -1, :], pred1)          # [B, 16]
                 X_next  = torch.cat([X_batch[:, 1:, :], new_row.unsqueeze(1)], dim=1) # [B, 8, 16]
-                pred2 = model(X_next, ctx_batch)
+                mask_next = torch.cat(
+                    [mask_batch[:, 1:],
+                     torch.zeros(X_batch.shape[0], 1, dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+                pred2 = model(X_next, ctx_batch, mask=mask_next)
                 loss2 = criterion(pred2, y_batch[:, 1, :], new_row)
 
                 loss = loss1 + rollout_lambda * loss2
@@ -184,12 +190,13 @@ def train():
         all_y_true_norm = []
 
         with torch.no_grad():
-            for X_batch, y_batch, ctx_batch in val_loader:
-                X_batch   = X_batch.to(device)
-                y_batch   = y_batch.to(device)
-                ctx_batch = ctx_batch.to(device)
+            for X_batch, y_batch, ctx_batch, mask_batch in val_loader:
+                X_batch    = X_batch.to(device)
+                y_batch    = y_batch.to(device)
+                ctx_batch  = ctx_batch.to(device)
+                mask_batch = mask_batch.to(device)
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    pred = model(X_batch, ctx_batch)
+                    pred = model(X_batch, ctx_batch, mask=mask_batch)
                     loss = criterion(pred, y_batch[:, 0, :], X_batch[:, -1, :])
                 val_losses.append(loss.item())
                 all_pred_norm.append(pred.cpu().numpy())

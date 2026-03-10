@@ -23,10 +23,10 @@ python -m src.data.preprocessor
 python -m src.db.ingest
 
 # Train Transformer model (reads from DB, writes checkpoint to models/)
-python -m src.models.train
+python -m src.model.train
 
 # Evaluate on test set + generate plots
-python -m src.models.evaluate
+python -m src.model.evaluate
 ```
 
 ## Architecture
@@ -50,7 +50,7 @@ Two tables:
 
 `ON CONFLICT DO NOTHING` is used everywhere — ingestion is idempotent.
 
-### ML Pipeline (`src/models/`)
+### ML Pipeline (`src/model/`)
 
 - **`dataset.py`** — loads from DB via SQL join, engineers 16 features (including delta lat/lon and cyclical `storm_dir`), builds `SEQ_LEN=8` sliding windows, fits `StandardScaler` on train rows only (SEASON ≤ 2014). Exports `build_datasets()` which returns `(train_ds, val_ds, test_ds, scaler_X, scaler_y)`.
 - **`transformer.py`** — `StormTransformer`: input projection + learned positional embeddings → 3-layer TransformerEncoder (4 heads, d_ff=256) → mean pool → MLP head → 3 outputs (d_lat, d_lon, wind_speed).
@@ -70,7 +70,7 @@ Two tables:
 
 ### Coordinate Convention
 
-Targets are **deltas** (d_lat, d_lon), not absolute positions. Use `predict_absolute()` from `dataset.py` to recover absolute lat/lon by adding deltas to the last known position in the window. `nature` is label-encoded 0–5 in `dataset.py` (DS=0, ET=1, MX=2, NR=3, SS=4, TS=5) — this differs from the DB schema's `nature_types` lookup which uses 0–4.
+Targets are **deltas** (d_lat, d_lon), not absolute positions. Use `predict_absolute()` from `src/model/dataset.py` to recover absolute lat/lon by adding deltas to the last known position in the window. `nature` is label-encoded 0–5 in `dataset.py` (DS=0, ET=1, MX=2, NR=3, SS=4, TS=5) — this differs from the DB schema's `nature_types` lookup which uses 0–4.
 
 ### Runtime Artifacts (git-ignored)
 
