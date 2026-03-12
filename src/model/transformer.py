@@ -1,21 +1,21 @@
 """
-StormTransformer — Transformer encoder for storm trajectory + intensity prediction.
+StormTransformer - Transformer encoder for storm trajectory + intensity prediction.
 
 Architecture:
   Input [batch, SEQ_LEN, n_features]
-  → Linear(n_features, d_model)
+  -> Linear(n_features, d_model)
   + learned positional embedding [SEQ_LEN, d_model]
   + basin/season context embedding (broadcast over sequence)
-  → TransformerEncoder (3 layers, 4 heads, d_ff=256, dropout=0.1)
-  → last-token pool → Linear(d_model, d_model) → GELU → Dropout
-  → Linear(d_model, 3)
-  Output [batch, 3]  — normalised (d_lat, d_lon, wind_speed)
+  -> TransformerEncoder (3 layers, 4 heads, d_ff=256, dropout=0.1)
+  -> last-token pool -> Linear(d_model, d_model) -> GELU -> Dropout
+  -> Linear(d_model, N_ROLLOUT_STEPS * 3)
+  Output [batch, N_ROLLOUT_STEPS, 3]  - normalised (d_lat, d_lon, wind_speed) for each step
 """
 
 import torch
 import torch.nn as nn
 
-from .dataset import N_FEATURES, N_TARGETS, SEQ_LEN, N_BASINS
+from .dataset import N_FEATURES, N_TARGETS, SEQ_LEN, N_BASINS, N_ROLLOUT_STEPS
 
 
 class StormTransformer(nn.Module):
@@ -31,8 +31,12 @@ class StormTransformer(nn.Module):
         n_targets: int = N_TARGETS,
         n_basins: int = N_BASINS,
         use_season: bool = True,
+        n_rollout_steps: int = N_ROLLOUT_STEPS,
     ):
         super().__init__()
+
+        self.n_rollout_steps = n_rollout_steps
+        self.n_targets = n_targets
 
         self.input_proj = nn.Linear(n_features, d_model)
         self.pos_emb = nn.Embedding(seq_len, d_model)
@@ -57,7 +61,7 @@ class StormTransformer(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, n_targets),
+            nn.Linear(d_model, n_rollout_steps * n_targets),
         )
 
         self._register_positions(seq_len)
@@ -68,7 +72,7 @@ class StormTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor, mask=None) -> torch.Tensor:
         # x:    [batch, seq_len, n_features]
-        # ctx:  [batch, 2]  — (basin_id as float, season_norm)
+        # ctx:  [batch, 2]  - (basin_id as float, season_norm)
         # mask: [batch, seq_len] bool, True=padded position (ignored by attention)
         x = self.input_proj(x)                         # [batch, seq_len, d_model]
         x = x + self.pos_emb(self.positions)           # broadcast positional emb
@@ -81,7 +85,8 @@ class StormTransformer(nn.Module):
 
         x = self.encoder(x, src_key_padding_mask=mask) # [batch, seq_len, d_model]
         x = x[:, -1, :]                                # last-token pool [batch, d_model]
-        return self.head(x)                            # [batch, n_targets]
+        out = self.head(x)                             # [batch, n_rollout_steps * n_targets]
+        return out.view(out.shape[0], self.n_rollout_steps, self.n_targets)  # [batch, N_ROLLOUT_STEPS, 3]
 
 
 def count_parameters(model: nn.Module) -> int:

@@ -5,7 +5,7 @@ Usage:
     DATABASE_URL=postgresql://... python -m src.model.evaluate
 
 Outputs:
-    - Mean haversine distance (km) vs RF baseline ~875 km
+    - Mean haversine distance (km)
     - Wind speed MAE (knots)
     - Trajectory plots for 3 test storms
     - Training/validation loss curve
@@ -51,10 +51,10 @@ def evaluate_test(model, test_ds, scaler_X, scaler_y, device):
             X_batch    = X_batch.to(device)
             ctx_batch  = ctx_batch.to(device)
             mask_batch = mask_batch.to(device)
-            pred = model(X_batch, ctx_batch, mask=mask_batch)
-            all_pred_norm.append(pred.cpu().numpy())
+            pred = model(X_batch, ctx_batch, mask=mask_batch)   # [B, 8, 3]
+            all_pred_norm.append(pred[:, 0, :].cpu().numpy())   # extract step-1
             all_X_last.append(X_batch[:, -1, :].cpu().numpy())
-            all_y_true_norm.append(y_batch[:, 0, :].numpy())  # step-1 target
+            all_y_true_norm.append(y_batch[:, 0, :].numpy())    # step-1 target
 
     pred_norm  = np.concatenate(all_pred_norm, axis=0)
     X_last     = np.concatenate(all_X_last, axis=0)
@@ -140,7 +140,7 @@ def plot_trajectories(scaler_X, scaler_y, device):
             mask_t  = torch.tensor(mask_np).unsqueeze(0).to(device)
             window  = torch.tensor(window_raw).unsqueeze(0).to(device)
             with torch.no_grad():
-                pred_norm_t = model(window, ctx_tensor, mask=mask_t).cpu().numpy()
+                pred_norm_t = model(window, ctx_tensor, mask=mask_t)[:, 0, :].cpu().numpy()
             X_last = feats_norm[k-1 : k]
             lat_p, lon_p, _ = predict_absolute(pred_norm_t, X_last, scaler_X, scaler_y)
             pred_lats.append(lat_p[0])
@@ -165,7 +165,7 @@ def plot_loss_curves():
     """Plot training and validation loss curves from training_log.json."""
     log_path = MODELS_DIR / "training_log.json"
     if not log_path.exists():
-        print("No training_log.json found — skipping loss curve plot.")
+        print("No training_log.json found - skipping loss curve plot.")
         return
 
     with open(log_path) as f:
@@ -200,7 +200,6 @@ def plot_loss_curves():
 
     hav = [e["val_haversine_km"] for e in log]
     axes[1].plot(epochs, hav, color="purple", label="Val Haversine (km)")
-    axes[1].axhline(875, color="red", linestyle="--", label="RF baseline 875 km")
     axes[1].axvline(best_epoch, color="green", linestyle="--")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Haversine distance (km)")

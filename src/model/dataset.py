@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 SEQ_LEN = 8
 N_FEATURES = 16
 N_TARGETS = 3
-N_ROLLOUT_STEPS = 2
+N_ROLLOUT_STEPS = 8
 
 MODELS_DIR = Path(__file__).parents[2] / "models"
 
@@ -98,16 +98,16 @@ def _make_windows(df: pd.DataFrame, storm_ids):
     Build sliding windows of length SEQ_LEN with left-zero-padding for warmup windows.
 
     For each storm, generates windows starting from the very first timestep:
-      Predict obs_1: window = [PAD×7, obs_0]        mask = [T,T,T,T,T,T,T,F]
-      Predict obs_2: window = [PAD×6, obs_0, obs_1]  mask = [T,T,T,T,T,T,F,F]
+      Predict obs_1: window = [PAD*7, obs_0]        mask = [T,T,T,T,T,T,T,F]
+      Predict obs_2: window = [PAD*6, obs_0, obs_1]  mask = [T,T,T,T,T,T,F,F]
       ...
       Predict obs_8: window = [obs_0..obs_7]          mask = [F,F,F,F,F,F,F,F]
 
     Returns:
         X    [n_windows, SEQ_LEN, N_FEATURES]
         y    [n_windows, N_ROLLOUT_STEPS, N_TARGETS]
-        ctx  [n_windows, 2]       — (basin_id, season_norm)
-        mask [n_windows, SEQ_LEN] — bool, True=padded (ignore), False=real
+        ctx  [n_windows, 2]       - (basin_id, season_norm)
+        mask [n_windows, SEQ_LEN] - bool, True=padded (ignore), False=real
     """
     X_list, y_list, ctx_list, mask_list = [], [], [], []
     for sid in storm_ids:
@@ -159,7 +159,7 @@ def build_datasets(save_scalers: bool = True):
         train_ds, val_ds, test_ds : StormWindowDataset
         scaler_X, scaler_y        : fitted StandardScaler objects
     """
-    print("Loading data from database…")
+    print("Loading data from database...")
     df = _load_from_db()
     print(f"  Loaded {len(df):,} rows, {df['atcf_id'].nunique():,} unique storms.")
 
@@ -180,7 +180,7 @@ def build_datasets(save_scalers: bool = True):
     X_val,   y_val,   ctx_val,   mask_val   = _make_windows(df, val_ids)
     X_test,  y_test,  ctx_test,  mask_test  = _make_windows(df, test_ids)
 
-    print(f"  Windows — Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
+    print(f"  Windows - Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
 
     # Log basin distribution
     for split_name, ctx_arr in [("Train", ctx_train), ("Val", ctx_val), ("Test", ctx_test)]:

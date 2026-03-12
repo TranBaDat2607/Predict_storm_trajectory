@@ -5,8 +5,8 @@ Usage:
     DATABASE_URL=postgresql://... python -m src.model.train
 
 Saves:
-    models/storm_transformer.pt   — best checkpoint (lowest val Haversine km)
-    models/training_log.json      — per-epoch metrics
+    models/storm_transformer.pt   - best checkpoint (lowest val Haversine km)
+    models/training_log.json      - per-epoch metrics
 """
 
 import json
@@ -35,10 +35,6 @@ ETA_MIN = 1e-5
 
 # Loss weights
 LAMBDA_WIND = 0.1      # wind MAE weight relative to Haversine km loss
-
-# Autoregressive rollout
-N_ROLLOUT_STEPS = 2    # must match dataset.N_ROLLOUT_STEPS
-ROLLOUT_LAMBDA = 0.5   # max weight for step-2 loss; ramped from 0 over first 20 epochs
 
 
 class HaversineLoss(nn.Module):
@@ -81,17 +77,35 @@ class HaversineLoss(nn.Module):
         wind_mae = torch.abs(pred_raw[:, 2] - true_raw[:, 2]).mean()
         return hav_km.mean() + self.lambda_wind * wind_mae
 
-    def build_next_row(self, X_last_norm, pred_norm):
-        """Construct next normalized feature row from last row + prediction (differentiable)."""
-        pred_raw = self._denorm_y(pred_norm)               # [B, 3]
-        X_raw    = X_last_norm * self.X_std + self.X_mean  # [B, 16]
-        new_row  = X_raw.clone()
-        new_row[:, 0] = X_raw[:, 0] + pred_raw[:, 0]      # lat
-        new_row[:, 1] = X_raw[:, 1] + pred_raw[:, 1]      # lon
-        new_row[:, 2] = pred_raw[:, 0]                     # d_lat
-        new_row[:, 3] = pred_raw[:, 1]                     # d_lon
-        new_row[:, 7] = pred_raw[:, 2]                     # wind_speed
-        return (new_row - self.X_mean) / self.X_std        # re-normalize [B, 16]
+    def multi_step_loss(self, pred_norm, y_norm, X_last_norm):
+        """
+        Direct multi-horizon loss: Haversine at each step using actual anchor positions.
+        pred_norm   : [B, N_ROLLOUT_STEPS, 3] - all steps from one forward pass
+        y_norm      : [B, N_ROLLOUT_STEPS, 3]
+        X_last_norm : [B, 16]
+        """
+        # Denormalize all targets: [B, N_ROLLOUT_STEPS, 3]
+        y_raw = y_norm * self.y_std + self.y_mean
+
+        # Starting raw lat/lon from last window position
+        X_raw = X_last_norm * self.X_std + self.X_mean   # [B, 16]
+        cur_lat = X_raw[:, 0]   # [B]
+        cur_lon = X_raw[:, 1]   # [B]
+
+        step_losses = []
+        for j in range(pred_norm.shape[1]):
+            # Build anchor X_last where col 0 = normalized cur_lat
+            anchor_norm = (torch.stack([cur_lat, cur_lon], dim=1) - self.X_mean[:2]) / self.X_std[:2]
+            X_anchor = X_last_norm.clone()
+            X_anchor[:, 0] = anchor_norm[:, 0]
+
+            step_losses.append(self.forward(pred_norm[:, j, :], y_norm[:, j, :], X_anchor))
+
+            # Advance anchor by ground-truth delta (teacher forcing on position)
+            cur_lat = cur_lat + y_raw[:, j, 0]
+            cur_lon = cur_lon + y_raw[:, j, 1]
+
+        return torch.stack(step_losses).mean()
 
 
 def train():
@@ -105,11 +119,11 @@ def train():
     device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
         props = torch.cuda.get_device_properties(0)
-        print(f"Device: {device} — {props.name} ({props.total_memory / 1024**3:.1f} GB VRAM)")
+        print(f"Device: {device} - {props.name} ({props.total_memory / 1024**3:.1f} GB VRAM)")
     else:
         print(f"Device: {device} (no CUDA GPU found)")
 
-    # ── Data ────────────────────────────────────────────────────────────────
+    # --- Data ---
     train_ds, val_ds, test_ds, scaler_X, scaler_y = build_datasets(save_scalers=True)
 
     train_loader = DataLoader(
@@ -121,11 +135,11 @@ def train():
         num_workers=0, pin_memory=use_cuda,
     )
 
-    # ── Model ────────────────────────────────────────────────────────────────
+    # --- Model ---
     model = StormTransformer().to(device)
     print(f"Parameters: {count_parameters(model):,}")
 
-    # Automatic mixed precision — only enabled when GPU arch is fully supported
+    # Automatic mixed precision - only enabled when GPU arch is fully supported
     scaler_amp = torch.amp.GradScaler(device.type, enabled=use_amp)
     print(f"AMP enabled    : {use_amp}")
 
@@ -135,16 +149,13 @@ def train():
     )
     criterion = HaversineLoss(scaler_X, scaler_y, lambda_wind=LAMBDA_WIND).to(device)
 
-    # ── Training loop ────────────────────────────────────────────────────────
+    # --- Training loop ---
     best_val_loss = float("inf")
     epochs_no_improve = 0
     log = []
 
     for epoch in range(1, MAX_EPOCHS + 1):
         t0 = time.time()
-
-        # Ramp rollout lambda: 0 for epochs 1–20, linearly up to ROLLOUT_LAMBDA by epoch 40
-        rollout_lambda = min(ROLLOUT_LAMBDA, max(0.0, (epoch - 20) / 20.0) * ROLLOUT_LAMBDA)
 
         model.train()
         train_losses = []
@@ -156,22 +167,9 @@ def train():
 
             optimizer.zero_grad()
             with torch.amp.autocast(device.type, enabled=use_amp):
-                # Step 1
-                pred1 = model(X_batch, ctx_batch, mask=mask_batch)
-                loss1 = criterion(pred1, y_batch[:, 0, :], X_batch[:, -1, :])
-
-                # Step 2 (autoregressive rollout — fully differentiable)
-                new_row = criterion.build_next_row(X_batch[:, -1, :], pred1)          # [B, 16]
-                X_next  = torch.cat([X_batch[:, 1:, :], new_row.unsqueeze(1)], dim=1) # [B, 8, 16]
-                mask_next = torch.cat(
-                    [mask_batch[:, 1:],
-                     torch.zeros(X_batch.shape[0], 1, dtype=torch.bool, device=device)],
-                    dim=1,
-                )
-                pred2 = model(X_next, ctx_batch, mask=mask_next)
-                loss2 = criterion(pred2, y_batch[:, 1, :], new_row)
-
-                loss = loss1 + rollout_lambda * loss2
+                pred = model(X_batch, ctx_batch, mask=mask_batch)         # [B, 8, 3]
+                loss = criterion.multi_step_loss(pred, y_batch, X_batch[:, -1, :])
+                loss1 = criterion(pred[:, 0, :], y_batch[:, 0, :], X_batch[:, -1, :])  # for logging
 
             scaler_amp.scale(loss).backward()
             scaler_amp.unscale_(optimizer)
@@ -182,7 +180,7 @@ def train():
 
         train_loss_km = np.mean(train_losses)
 
-        # Validation — step-1 only for metrics
+        # Validation - step-1 only for metrics
         model.eval()
         val_losses = []
         all_pred_norm = []
@@ -196,10 +194,10 @@ def train():
                 ctx_batch  = ctx_batch.to(device)
                 mask_batch = mask_batch.to(device)
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    pred = model(X_batch, ctx_batch, mask=mask_batch)
-                    loss = criterion(pred, y_batch[:, 0, :], X_batch[:, -1, :])
+                    pred = model(X_batch, ctx_batch, mask=mask_batch)     # [B, 8, 3]
+                    loss = criterion(pred[:, 0, :], y_batch[:, 0, :], X_batch[:, -1, :])
                 val_losses.append(loss.item())
-                all_pred_norm.append(pred.cpu().numpy())
+                all_pred_norm.append(pred[:, 0, :].cpu().numpy())
                 all_X_last.append(X_batch[:, -1, :].cpu().numpy())
                 all_y_true_norm.append(y_batch[:, 0, :].cpu().numpy())
 
@@ -228,7 +226,6 @@ def train():
             f"Train loss: {train_loss_km:.2f} km | "
             f"Val loss: {val_loss_km:.2f} km | "
             f"Val Haversine: {val_haversine:.1f} km | "
-            f"rollout_λ: {rollout_lambda:.2f} | "
             f"LR: {current_lr:.3e} | "
             f"Time: {elapsed:.1f}s"
         )
@@ -238,7 +235,6 @@ def train():
             "train_loss_km": float(train_loss_km),
             "val_loss_km": float(val_loss_km),
             "val_haversine_km": float(val_haversine),
-            "rollout_lambda": float(rollout_lambda),
             "lr": float(current_lr),
         })
 
