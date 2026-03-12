@@ -90,18 +90,25 @@
                        │        ↓                 │
                        │  Dropout(0.1)            │
                        │        ↓                 │
-                       │  Linear(64 → 3)          │
-                       │  [batch, 3]              │
+                       │  Linear(64 → 24)         │
+                       │  [batch, 24]             │
+                       │        ↓                 │
+                       │  .view(-1, 8, 3)         │
+                       │  [batch, 8, 3]           │
                        └──────────────┬───────────┘
                                       │
                                       ▼
                        ┌──────────────────────────┐
                        │         OUTPUT           │
-                       │       [batch, 3]         │
+                       │     [batch, 8, 3]        │
                        │                          │
-                       │  [0] d_lat   (normalized)│
-                       │  [1] d_lon   (normalized)│
-                       │  [2] wind_speed (norm.)  │
+                       │  step 0 (+3h):           │
+                       │    [0] d_lat  (norm.)    │
+                       │    [1] d_lon  (norm.)    │
+                       │    [2] wind   (norm.)    │
+                       │  step 1 (+6h): ...       │
+                       │  ...                     │
+                       │  step 7 (+24h): ...      │
                        └──────────────────────────┘
 ```
 
@@ -116,7 +123,8 @@
 | After `+pos_emb +ctx_emb` | `[batch, 8, 64]` |
 | After each Transformer layer | `[batch, 8, 64]` |
 | After last-token pool | `[batch, 64]` |
-| After MLP head | `[batch, 3]` |
+| After MLP head (flat) | `[batch, 24]` |
+| After `.view(-1, 8, 3)` | `[batch, 8, 3]` |
 
 ---
 
@@ -150,13 +158,17 @@
 | 0 | `basin_id` | Basin, label-encoded 0–6 (EP/NA/NI/SA/SI/SP/WP) |
 | 1 | `season_norm` | `(season − 1980) / 40.0` |
 
-### Targets (3)
+### Targets (3 × 8 steps)
 
-| # | Target | Description |
+One forward pass outputs all 8 future 3h steps simultaneously:
+
+| Axis | Dim | Meaning |
 |---|---|---|
-| 0 | `d_lat` | Latitude delta at next timestep |
-| 1 | `d_lon` | Longitude delta at next timestep |
-| 2 | `wind_speed` | Wind speed at next timestep |
+| `[:, j, 0]` | step j | d_lat at t+3h×(j+1) (normalized) |
+| `[:, j, 1]` | step j | d_lon at t+3h×(j+1) (normalized) |
+| `[:, j, 2]` | step j | wind_speed at t+3h×(j+1) (normalized) |
+
+Steps 0–7 correspond to +3h, +6h, …, +24h. To recover absolute position, cumsum the predicted deltas from the last known lat/lon.
 
 ---
 
@@ -172,16 +184,24 @@
 | Max epochs | 100 |
 | Early stopping patience | 10 |
 | Gradient clip norm | 1.0 |
-| Loss function | Haversine (km) + 0.1 × wind MAE |
-| Rollout steps | 2 (step-2 loss ramped in epochs 20→40) |
+| Loss function | Multi-step Haversine (km) + 0.1 × wind MAE |
+| Output steps | 8 (all predicted in one forward pass) |
 | AMP | Enabled for GPU arch < sm_120 |
 
 ### Loss Formula
 
 ```
-loss = haversine_km(pred_pos, true_pos).mean()
-     + 0.1 × |pred_wind − true_wind|.mean()
-     + rollout_λ × loss_step2
+loss = mean over j in [0..7] of:
+    haversine_km(anchor_j + pred_d_latlon_j, anchor_j + true_d_latlon_j).mean()
+    + 0.1 × |pred_wind_j − true_wind_j|.mean()
 ```
 
-`rollout_λ` ramps from 0 (epoch 1–20) to 0.5 (epoch 40+), training the model to minimise compounding error over 2 autoregressive steps.
+`anchor_j` is the true accumulated position after j steps (teacher forcing on position). No autoregressive rollout — one forward pass, zero error compounding.
+
+### Multi-Horizon Evaluation
+
+| Horizon | Method |
+|---|---|
+| 3h (step-1) | `pred[:, 0, :]` direct |
+| 24h (8-step) | 1 forward pass, cumsum 8 predicted deltas |
+| 48h (16-step) | 2 forward passes chained; chunk 2 input = chunk 1 predicted rows |
