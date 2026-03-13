@@ -12,3 +12,4 @@ psycopg2-binary
 python-dotenv
 torch>=2.2.0
 joblib
+cartopy>=0.22.0

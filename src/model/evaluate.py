@@ -161,6 +161,122 @@ def plot_trajectories(scaler_X, scaler_y, device):
     print(f"Trajectory plot saved to {MODELS_DIR}/trajectory_plots.png")
 
 
+def plot_trajectories_earth(scaler_X, scaler_y, device):
+    """
+    Plot predicted vs actual trajectories on a real Earth map background.
+    Uses cartopy PlateCarree projection with NASA Blue Marble stock image.
+    Saves to models/trajectory_plots_earth.png.
+    Requires: pip install cartopy>=0.22.0
+    """
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+    except ImportError as e:
+        raise ImportError(
+            "cartopy is required for plot_trajectories_earth(). "
+            "Install it with: pip install cartopy>=0.22.0"
+        ) from e
+
+    df = _load_from_db()
+    df = _engineer_features(df)
+    test_storms = df[df["season"] >= 2020]["atcf_id"].unique()
+
+    storm_lengths = {
+        sid: len(df[df["atcf_id"] == sid])
+        for sid in test_storms
+        if len(df[df["atcf_id"] == sid]) > 1
+    }
+    lengths = sorted(storm_lengths.values())
+    short_thr = np.percentile(lengths, 25)
+    long_thr  = np.percentile(lengths, 75)
+
+    chosen = []
+    for label, condition in [
+        ("short",  lambda l: l <= short_thr),
+        ("medium", lambda l: short_thr < l < long_thr),
+        ("long",   lambda l: l >= long_thr),
+    ]:
+        candidates = [sid for sid, l in storm_lengths.items() if condition(l)]
+        if candidates:
+            chosen.append((label, candidates[0]))
+        if len(chosen) == 3:
+            break
+
+    model = load_model(device)
+    projection = ccrs.PlateCarree()
+    fig, axes = plt.subplots(
+        1, len(chosen),
+        figsize=(8 * len(chosen), 6),
+        subplot_kw={"projection": projection},
+    )
+    if len(chosen) == 1:
+        axes = [axes]
+
+    for ax, (label, sid) in zip(axes, chosen):
+        storm = df[df["atcf_id"] == sid].reset_index(drop=True)
+        feats      = storm[FEATURE_COLS].values.astype(np.float32)
+        feats_norm = scaler_X.transform(feats).astype(np.float32)
+
+        basin_id    = int(storm["basin_id"].iloc[0])
+        season_norm = float(storm["season_norm"].iloc[0])
+        ctx_tensor  = torch.tensor([[basin_id, season_norm]], dtype=torch.float32).to(device)
+
+        true_lats = storm["lat"].values
+        true_lons = storm["lon"].values
+
+        pred_lats, pred_lons = [], []
+        for k in range(1, len(storm)):
+            real_start = max(0, k - SEQ_LEN)
+            window_raw = feats_norm[real_start:k]
+            real_len   = len(window_raw)
+            pad_len    = SEQ_LEN - real_len
+            if pad_len > 0:
+                pad = np.zeros((pad_len, N_FEATURES), dtype=np.float32)
+                window_raw = np.concatenate([pad, window_raw], axis=0)
+            mask_np = np.array([True]*pad_len + [False]*real_len, dtype=bool)
+            mask_t  = torch.tensor(mask_np).unsqueeze(0).to(device)
+            window  = torch.tensor(window_raw).unsqueeze(0).to(device)
+            with torch.no_grad():
+                pred_norm_t = model(window, ctx_tensor, mask=mask_t)[:, 0, :].cpu().numpy()
+            X_last = feats_norm[k-1:k]
+            lat_p, lon_p, _ = predict_absolute(pred_norm_t, X_last, scaler_X, scaler_y)
+            pred_lats.append(lat_p[0])
+            pred_lons.append(lon_p[0])
+
+        # Auto-compute map extent with 5° padding, clamped to valid bounds
+        all_lats = np.concatenate([true_lats, pred_lats])
+        all_lons = np.concatenate([true_lons, pred_lons])
+        pad_deg  = 5.0
+        extent = [
+            max(float(all_lons.min()) - pad_deg, -180.0),
+            min(float(all_lons.max()) + pad_deg,  180.0),
+            max(float(all_lats.min()) - pad_deg,  -90.0),
+            min(float(all_lats.max()) + pad_deg,   90.0),
+        ]
+        ax.set_extent(extent, crs=projection)
+
+        ax.stock_img()  # NASA Blue Marble raster background
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor="white")
+        ax.add_feature(cfeature.BORDERS,   linewidth=0.4, edgecolor="white", linestyle=":")
+        ax.gridlines(draw_labels=True, linewidth=0.4, color="white", alpha=0.5, linestyle="--")
+
+        ax.plot(true_lons, true_lats, "b-o",  markersize=3, linewidth=1.5,
+                label="Actual",    transform=projection)
+        ax.plot(pred_lons, pred_lats, "r--s", markersize=3, linewidth=1.5,
+                label="Predicted", transform=projection)
+
+        ax.set_title(f"{sid} ({label})", color="white", fontsize=11, pad=8)
+        ax.legend(fontsize=8, loc="lower left",
+                  facecolor="black", labelcolor="white", framealpha=0.6)
+
+    plt.suptitle("Storm Trajectory: Predicted vs Actual (Earth Background)", fontsize=13)
+    plt.tight_layout()
+    out_path = MODELS_DIR / "trajectory_plots_earth.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"Earth trajectory plot saved to {out_path}")
+
+
 def plot_loss_curves():
     """Plot training and validation loss curves from training_log.json."""
     log_path = MODELS_DIR / "training_log.json"

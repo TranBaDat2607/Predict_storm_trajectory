@@ -1,54 +1,156 @@
 # Predict Storm Trajectory
 
-Predict tropical storm trajectories in the Western Pacific using machine learning.
-Data is sourced from the IBTrACS dataset via NCICS.
+Predicts tropical cyclone track and intensity using a Transformer model trained on historical IBTrACS data.
+Given the last 24 hours of observations, the model outputs the next 8 positions and wind speeds at 3-hour intervals (up to +24 h ahead) in a single forward pass.
+
+---
+
+## Data
+
+Source: [IBTrACS](https://ncics.org/ibtracs/) — International Best Track Archive for Climate Stewardship (NCICS/NOAA)
+
+| Stat | Value |
+|---|---|
+| Total observations | 132,646 rows |
+| Unique storms | 2,343 |
+| Temporal resolution | 3-hourly |
+| Coverage | 1945 - 2026 |
+| Train split | Seasons up to 2014 (~99K windows) |
+| Validation split | Seasons 2015 - 2019 (~7.5K windows) |
+| Test split | Seasons 2020 and later (~7.2K windows) |
+
+Each observation includes position (lat/lon), wind speed, pressure, storm heading and speed, distance to land, and Saffir-Simpson category. The pipeline engineers 16 input features plus a 2-element context vector (basin, season).
+
+See `src/db/schema.sql` for the full PostgreSQL schema.
+
+---
+
+## Model
+
+StormTransformer — a 3-layer Transformer encoder with ~158K parameters.
+
+```
+Input [batch, 8, 16] -> Linear(16->64) + positional embedding + context embedding
+    -> TransformerEncoder (3 layers, 4 heads, d_ff=256)
+    -> Last-token pool [batch, 64]
+    -> MLP head -> [batch, 8, 3]
+```
+
+- Input: 8-step sliding window (24 h) of 16 storm features
+- Context: basin embedding and season projection, added at every timestep
+- Output: 8 future steps x 3 targets (d_lat, d_lon, wind speed) — all in one forward pass, no autoregressive rollout
+- Padding: left-zero-padding with attention masking so the model can predict from the very first timestep of a storm
+
+Training settings:
+
+| Setting | Value |
+|---|---|
+| Optimizer | AdamW (lr=1e-3, weight decay=1e-4) |
+| Scheduler | CosineAnnealingLR |
+| Batch size | 512 |
+| Early stopping patience | 10 epochs |
+| Loss | Multi-step Haversine (km) + 0.1 * wind MAE |
+
+For the full architecture diagram and feature reference see [docs/architecture.md](docs/architecture.md).
+
+---
+
+## Results
+
+Test set: seasons 2020 and later.
+
+| Horizon | Mean error | Median error |
+|---|---|---|
+| 3 h (direct, step 1) | 8.4 km | 7.0 km |
+| 24 h (1 forward pass, 8 steps) | 146 km | 127 km |
+| 48 h (2 chained passes, 16 steps) | 405 km | 358 km |
+
+Wind speed MAE: ~3.1 knots
+
+Trajectory plots show predicted (red) vs actual (blue) tracks for short, medium, and long storms from the test set.
+
+Basic plot:
+
+![Trajectory plots](result_images/trajectory_plots.png)
+
+Earth background:
+
+![Trajectory plots on Earth map](result_images/trajectory_plots_earth.png)
+
+Training and validation loss curves:
+
+![Loss curves](result_images/loss_curves.png)
+
+---
 
 ## Project Structure
 
 ```
 data/
-  raw/               # Raw crawled CSV (git-ignored)
-  processed/         # Preprocessed model-ready CSV (git-ignored)
+  raw/                          # Raw crawled CSV (git-ignored)
+  processed/                    # Preprocessed CSV (git-ignored)
+docs/
+  architecture.md               # Full model architecture and hyperparameters
 notebooks/
-  experiments.ipynb          # Exploratory analysis and modelling
-  preprocessing_data.ipynb   # Preprocessing walkthrough
+  train_model.ipynb             # End-to-end training and evaluation notebook
 src/
   crawling_data/
-    crawler.py       # Web scraper for NCICS IBTrACS
+    crawler.py                  # Parallel IBTrACS web scraper
   data/
-    loader.py        # CSV loader and column definitions
-    preprocessor.py  # Full preprocessing pipeline
-    validator.py     # Data validation utilities
+    preprocessor.py             # Full preprocessing pipeline
   db/
-    schema.sql       # PostgreSQL + PostGIS DDL
-    ingest.py        # Load processed CSV into PostgreSQL
-setup_db.bat         # One-click database setup (Windows)
+    schema.sql                  # PostgreSQL + PostGIS schema
+    ingest.py                   # Load processed CSV into PostgreSQL
+  model/
+    dataset.py                  # Feature engineering, sliding windows, scalers
+    transformer.py              # StormTransformer nn.Module
+    train.py                    # Training loop, early stopping, checkpoint
+    evaluate.py                 # Metrics, trajectory plots, loss curves
+models/                         # Saved checkpoints and scalers (git-ignored)
+result_images/                  # Output plots
 requirements.txt
+setup_db.bat                    # One-click database setup (Windows)
 ```
-
-## Requirements
-
-- Python 3.10+
-- PostgreSQL with PostGIS extension installed
-- Dependencies: `pip install -r requirements.txt`
 
 ---
 
-## Step 1 - Crawl raw data
+## How to Run
 
-Fetches storm track data from [NCICS IBTrACS](https://ncics.org/ibtracs/) and saves it to `data/raw/storm_data.csv`.
+### Prerequisites
+
+- Python 3.10+
+- PostgreSQL with PostGIS extension installed
+- A CUDA-capable GPU is recommended
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Set the database connection string. Add this to a `.env` file at the project root or export it in your shell:
+
+```bash
+export DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/storm_db
+```
+
+---
+
+### Step 1 - Crawl raw data
+
+Downloads storm track records from IBTrACS and saves them to `data/raw/storm_data.csv`.
 
 ```bash
 python src/crawling_data/crawler.py
 ```
 
-This runs a parallel crawl with 10 workers. Depending on network speed it may take several minutes.
+Uses 10 parallel workers. Takes a few minutes depending on network speed.
 
 ---
 
-## Step 2 - Preprocess
+### Step 2 - Preprocess
 
-Cleans and transforms the raw data into a model-ready 18-column CSV at `data/processed/storm_data.csv`.
+Cleans and transforms the raw CSV into an 18-column model-ready file at `data/processed/storm_data.csv`.
 
 ```bash
 python -m src.data.preprocessor
@@ -56,62 +158,62 @@ python -m src.data.preprocessor
 
 ---
 
-## Step 3 - Set up the database
+### Step 3 - Set up the database
 
-### Option A - Automated (Windows)
-
-Run the provided batch file. It will ask for your PostgreSQL password and handle everything:
+Option A — Automated (Windows):
 
 ```
 setup_db.bat
 ```
 
-It will:
-1. Create the `storm_db` database
-2. Enable the PostGIS extension
-3. Apply the schema (`src/db/schema.sql`)
-4. Install `psycopg2-binary`
-5. Ingest the processed CSV into PostgreSQL
+Creates `storm_db`, enables PostGIS, applies the schema, and ingests the processed CSV.
 
-### Option B - Manual
+Option B — Manual:
 
 ```bash
-# Create database and enable PostGIS
 psql -U postgres -c "CREATE DATABASE storm_db;"
 psql -U postgres -d storm_db -c "CREATE EXTENSION postgis;"
-
-# Apply schema
 psql postgresql://postgres:yourpassword@localhost:5432/storm_db -f src/db/schema.sql
-
-# Install driver
-pip install psycopg2-binary
-
-# Run ingest
-DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/storm_db python -m src.db.ingest
+python -m src.db.ingest
 ```
 
-### Verify
+Verify the ingestion:
 
 ```sql
 SELECT COUNT(*) FROM storm_observations;  -- expect ~132,646
 SELECT COUNT(*) FROM storms;              -- expect ~2,343
 ```
 
-### Spatial query example (PostGIS)
+---
 
-```sql
-SELECT atcf_id, iso_time, lat, lon,
-       ST_Distance(geom, ST_MakePoint(120,15)::GEOGRAPHY) / 1000 AS dist_km
-FROM storm_observations
-WHERE ST_DWithin(geom, ST_MakePoint(120,15)::GEOGRAPHY, 500000)
-ORDER BY dist_km
-LIMIT 5;
+### Step 4 - Train
+
+```bash
+python -m src.model.train
 ```
+
+Saves the best checkpoint to `models/storm_transformer.pt` and the fitted scalers to `models/scaler_X.pkl` and `models/scaler_y.pkl`.
+
+---
+
+### Step 5 - Evaluate
+
+```bash
+python -m src.model.evaluate
+```
+
+Prints test metrics (Haversine distance and wind MAE) and saves trajectory plots and loss curves to `models/`.
+
+---
+
+### Notebook
+
+`notebooks/train_model.ipynb` runs the full pipeline interactively: dataset build, training, evaluation, multi-horizon error analysis, and trajectory plots including the Earth-background map view (requires `cartopy>=0.22.0`).
 
 ---
 
 ## Notes
 
-- Rows without a valid `USA ATCF_ID` are excluded from the database (35,231 rows).
-- Running `setup_db.bat` or the ingest script multiple times is safe — duplicate rows are skipped via `ON CONFLICT DO NOTHING`.
-- `data/raw/` and `data/processed/` are git-ignored. Re-generate them by running Steps 1 and 2.
+- Ingestion is idempotent. Re-running `ingest.py` or `setup_db.bat` multiple times is safe.
+- Rows without a valid `USA_ATCF_ID` are excluded from the database (about 35K rows).
+- `data/raw/`, `data/processed/`, and `models/` are git-ignored. Regenerate them by running Steps 1 to 4.
